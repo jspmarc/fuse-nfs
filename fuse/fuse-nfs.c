@@ -62,6 +62,13 @@ static char *logfile;
 
 /* Only one thread at a time can enter libnfs */
 static pthread_mutex_t nfs_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t nfs_reply_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t nfs_service_thread;
+static int nfs_service_running;
+static int nfs_service_started;
+#ifndef WIN32
+static int nfs_wakeup[2] = { -1, -1 };
+#endif
 
 #define discard_const(ptr) ((void *)((intptr_t)(ptr)))
 
@@ -127,36 +134,138 @@ struct sync_cb_data {
 };
 
 static void
-wait_for_nfs_reply(struct nfs_context *nfs, struct sync_cb_data *cb_data)
+wake_nfs_service(void)
 {
-	struct pollfd pfd;
-	int revents;
-	int ret;
-	static pthread_mutex_t reply_mutex = PTHREAD_MUTEX_INITIALIZER;
+#ifndef WIN32
+	char byte = 0;
+	ssize_t ret;
 
-	pthread_mutex_lock(&reply_mutex);
-	while (!cb_data->is_finished) {
+	do {
+		ret = write(nfs_wakeup[1], &byte, 1);
+	} while (ret < 0 && errno == EINTR);
+	/* A full pipe already carries a wakeup. */
+	if (ret < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+		perror("Failed to wake NFS service");
+		exit(EXIT_FAILURE);
+	}
+#endif
+}
 
-		pfd.fd = nfs_get_fd(nfs);
-		pfd.events = nfs_which_events(nfs);
-		pfd.revents = 0;
+static void *
+service_nfs(void *arg)
+{
+	struct nfs_context *context = arg;
+	struct pollfd pfd[2];
+	int count = 1;
+	int ret, revents;
 
-		ret = poll(&pfd, 1, 100);
-		if (ret < 0) {
-			revents = -1;
-		} else {
-			revents = pfd.revents;
+#ifndef WIN32
+	pfd[1].fd = nfs_wakeup[0];
+	pfd[1].events = POLLIN;
+	count = 2;
+#endif
+	pthread_mutex_lock(&nfs_mutex);
+	while (nfs_service_running) {
+		pfd[0].fd = nfs_get_fd(context);
+		pfd[0].events = nfs_which_events(context);
+		pfd[0].revents = 0;
+		pfd[1].revents = 0;
+		pthread_mutex_unlock(&nfs_mutex);
+
+		/* Keep servicing libnfs timers even when FUSE has no requests. */
+		ret = poll(pfd, count, 100);
+		if (ret < 0 && errno == EINTR) {
+			pfd[0].revents = pfd[1].revents = 0;
+			ret = 0;
 		}
+		revents = ret < 0 ? -1 : pfd[0].revents;
 
 		pthread_mutex_lock(&nfs_mutex);
-		ret = nfs_service(nfs, revents);
-		pthread_mutex_unlock(&nfs_mutex);
-		if (ret < 0) {
-			cb_data->status = -EIO;
+		if (!nfs_service_running)
 			break;
+#ifndef WIN32
+		if (pfd[1].revents & POLLIN) {
+			char bytes[128];
+			ssize_t len;
+			do {
+				len = read(nfs_wakeup[0], bytes, sizeof(bytes));
+			} while (len > 0 || (len < 0 && errno == EINTR));
+		}
+#endif
+		if (pfd[0].fd != nfs_get_fd(context))
+			revents = 0;
+		ret = nfs_service(context, revents);
+		/* Callbacks and their waiters share nfs_mutex, including results. */
+		pthread_cond_broadcast(&nfs_reply_cond);
+		if (ret < 0) {
+			fprintf(stderr, "NFS service failed: %s\n",
+				nfs_get_error(context));
+			/* Do not return while libnfs holds callbacks into waiter stacks. */
+			exit(EXIT_FAILURE);
 		}
 	}
-	pthread_mutex_unlock(&reply_mutex);
+	pthread_mutex_unlock(&nfs_mutex);
+	return NULL;
+}
+
+static void *
+fuse_nfs_init(struct fuse_conn_info *conn)
+{
+	int ret;
+	(void)conn;
+
+	/* FUSE calls init after daemonizing; no thread may span that fork. */
+#ifndef WIN32
+	if (pipe(nfs_wakeup) < 0) {
+		perror("Failed to create NFS wakeup pipe");
+		exit(EXIT_FAILURE);
+	}
+	for (int i = 0; i < 2; i++) {
+		if (fcntl(nfs_wakeup[i], F_SETFL, O_NONBLOCK) < 0 ||
+		    fcntl(nfs_wakeup[i], F_SETFD, FD_CLOEXEC) < 0) {
+			perror("Failed to configure NFS wakeup pipe");
+			exit(EXIT_FAILURE);
+		}
+	}
+#endif
+	nfs_service_running = 1;
+	ret = pthread_create(&nfs_service_thread, NULL, service_nfs, nfs);
+	if (ret != 0) {
+		fprintf(stderr, "Failed to start NFS service: %s\n", strerror(ret));
+		exit(EXIT_FAILURE);
+	}
+	nfs_service_started = 1;
+	return NULL;
+}
+
+static void
+stop_nfs_service(void)
+{
+	if (!nfs_service_started)
+		return;
+	pthread_mutex_lock(&nfs_mutex);
+	nfs_service_running = 0;
+	wake_nfs_service();
+	pthread_mutex_unlock(&nfs_mutex);
+	pthread_join(nfs_service_thread, NULL);
+	nfs_service_started = 0;
+#ifndef WIN32
+	close(nfs_wakeup[0]);
+	close(nfs_wakeup[1]);
+	nfs_wakeup[0] = nfs_wakeup[1] = -1;
+#endif
+}
+
+static void
+wait_for_nfs_reply(struct nfs_context *context, struct sync_cb_data *cb_data)
+{
+	(void)context;
+	pthread_mutex_lock(&nfs_mutex);
+	if (!cb_data->is_finished)
+		wake_nfs_service();
+	while (!cb_data->is_finished)
+		pthread_cond_wait(&nfs_reply_cond, &nfs_mutex);
+	pthread_mutex_unlock(&nfs_mutex);
 }
 
 static void
@@ -301,7 +410,9 @@ fuse_nfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		filler(buf, nfsdirent->name, NULL, 0);
 	}
 
+	pthread_mutex_lock(&nfs_mutex);
 	nfs_closedir(nfs, nfsdir);
+	pthread_mutex_unlock(&nfs_mutex);
 
 	return cb_data.status;
 }
@@ -507,12 +618,13 @@ static int fuse_nfs_utime(const char *path, struct utimbuf *times)
 	pthread_mutex_lock(&nfs_mutex);
 	update_rpc_credentials();
 	ret = nfs_utime_async(nfs, path, times, generic_cb, &cb_data);
-	pthread_mutex_unlock(&nfs_mutex);
 	if (ret < 0) {
                 LOG("fuse_nfs_utime returned %d. %s\n", ret,
                     nfs_get_error(nfs));
+		pthread_mutex_unlock(&nfs_mutex);
 		return ret;
 	}
+	pthread_mutex_unlock(&nfs_mutex);
 	wait_for_nfs_reply(nfs, &cb_data);
 
 	return cb_data.status;
@@ -819,6 +931,7 @@ fuse_nfs_statfs(const char *path, struct statvfs* stbuf)
 }
 
 static struct fuse_operations nfs_oper = {
+	.init		= fuse_nfs_init,
 	.chmod		= fuse_nfs_chmod,
 	.chown		= fuse_nfs_chown,
 	.create		= fuse_nfs_create,
@@ -1232,6 +1345,8 @@ int main(int argc, char *argv[])
 	ret = fuse_main(fuse_nfs_argc, fuse_nfs_argv, &nfs_oper, NULL);
 
 finished:
+	/* fuse_main has joined its workers; callbacks no longer own their stacks. */
+	stop_nfs_service();
 	nfs_destroy_url(urls);
 	if (nfs != NULL) {
 		nfs_destroy_context(nfs);

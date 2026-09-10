@@ -12,6 +12,20 @@ $ ./configure
 $ make
 $ sudo make install
 
+Tests
+=====
+
+`make check` runs the service-loop regression without a FUSE mount or NFS
+server. It checks idle servicing, interrupted poll, concurrent callbacks,
+an already completed reply, shutdown, startup after fork, and fatal errors.
+
+The NFS event loop runs independently of FUSE requests so libnfs can process
+timeouts and NFSv4.2 lease renewals while the mount is idle. Only that thread
+calls nfs_service(); callers and callbacks share the existing libnfs mutex.
+The thread starts in the FUSE init callback, after daemonization, and is
+joined before the NFS context is destroyed. It uses the existing async API,
+not libnfs's optional multithreading API.
+
 FUSE OPTIONS
 ============
 
